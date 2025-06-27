@@ -28,7 +28,7 @@ if not st.session_state.started:
         st.session_state.start_date = start_date
         st.session_state.end_date = end_date
 
-        # Extract transactions
+        # Extract and sort transactions
         def extract_transactions(pdf_file, start_date, end_date):
             transactions = []
             with pdfplumber.open(pdf_file) as pdf:
@@ -52,7 +52,8 @@ if not st.session_state.started:
                             if datum > end_date:
                                 continue
                             transactions.append({"Datum": datum, "Vart": namn, "Summa": summa})
-            return transactions
+            # Sort by date
+            return sorted(transactions, key=lambda x: x['Datum'])
 
         st.session_state.transactions = extract_transactions(uploaded_file, start_date, end_date)
         st.session_state.resultat = []
@@ -73,8 +74,13 @@ elif st.session_state.started:
         st.markdown(f"**Vart**: {t['Vart']}")
         st.markdown(f"**Summa**: {t['Summa']} kr")
 
-        vem = st.radio("Vem?", PERSONER, key=f"vem_{index}")
-        kategori = st.radio("Kategori?", KATEGORIER, key=f"kat_{index}")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            vem = st.radio("Vem?", PERSONER, key=f"vem_{index}", horizontal=True)
+
+        with col2:
+            kategori = st.radio("Kategori?", KATEGORIER, key=f"kat_{index}", horizontal=True)
 
         if st.button("Spara & Nästa ➡️"):
             t['Vem'] = vem
