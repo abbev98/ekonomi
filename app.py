@@ -5,59 +5,65 @@ from datetime import datetime
 import pdfplumber
 import re
 
-# Alternativen
+# Alternativ för flervalsval
 PERSONER = ['Albin', 'Nathalie', 'Gemensamt']
 KATEGORIER = ['Mat', 'Hushåll', 'Nöje', 'Resa', 'Restaurang', 'Kläder', 'Hälsa', 'Annat']
 
-# Parserfunktion
-def robust_extract_transactions(pdf_file, start_date, end_date):
+# Bättre parser som tolkar hela transaktionsblock
+def extract_transactions(pdf_file, start_date, end_date):
     transactions = []
-    current = {}
+    current_lines = []
+    pattern_datum = re.compile(r"(\d{2}\.\d{2}\.\d{2})\s+\d{2}\.\d{2}\.\d{2}")
 
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             lines = page.extract_text().split('\n')
             for line in lines:
-                date_match = re.match(r"(\d{2}\.\d{2}\.\d{2})\s+\d{2}\.\d{2}\.\d{2}\s+(.*)", line.strip())
-                if date_match:
-                    if current.get('Datum') and current.get('Vart') and current.get('Summa') is not None:
-                        transactions.append(current)
-                    datum_str = date_match.group(1)
-                    try:
-                        datum = datetime.strptime(datum_str, "%d.%m.%y").date()
-                    except ValueError:
-                        continue
-                    text = date_match.group(2).strip()
-                    current = {'Datum': datum, 'Vart': text, 'Summa': None}
+                if pattern_datum.match(line.strip()):
+                    if current_lines:
+                        transactions.append(current_lines)
+                    current_lines = [line.strip()]
                 else:
-                    if current:
-                        line = line.strip()
-                        match_amount = re.search(r"(-?\d{1,3}(?:[ \.]\d{3})*(?:,\d{2})?)\s*$", line)
-                        if match_amount:
-                            try:
-                                amount_str = match_amount.group(1).replace('.', '').replace(' ', '').replace(',', '.')
-                                current['Summa'] = float(amount_str)
-                                line = re.sub(r"(-?\d{1,3}(?:[ \.]\d{3})*(?:,\d{2})?)\s*$", '', line).strip()
-                            except ValueError:
-                                continue
-                        if line:
-                            current['Vart'] += f" {line}"
+                    if current_lines is not None:
+                        current_lines.append(line.strip())
+        if current_lines:
+            transactions.append(current_lines)
 
-    if current.get('Datum') and current.get('Vart') and current.get('Summa') is not None:
-        transactions.append(current)
+    parsed = []
+    for group in transactions:
+        datum_match = re.match(r"(\d{2}\.\d{2}\.\d{2})", group[0])
+        if not datum_match:
+            continue
+        datum = datetime.strptime(datum_match.group(1), "%d.%m.%y").date()
 
-    for tx in transactions:
-        if tx['Datum'] < start_date:
-            tx['Datum'] = start_date
-    transactions = [tx for tx in transactions if tx['Datum'] <= end_date]
-    return sorted(transactions, key=lambda x: x['Datum'])
+        text_block = " ".join(group)
+        amount_match = re.findall(r"(\d{1,3}(?:[ \.]\d{3})*(?:,\d{2}))", text_block)
+        if not amount_match:
+            continue
 
+        try:
+            amount_str = amount_match[-1].replace(".", "").replace(" ", "").replace(",", ".")
+            summa = float(amount_str)
+        except:
+            continue
 
-# Streamlit-start
+        text_clean = re.sub(r"(\d{1,3}(?:[ \.]\d{3})*(?:,\d{2}))", "", text_block)
+        text_clean = re.sub(r"\s{2,}", " ", text_clean).strip()
+
+        parsed.append({
+            "Datum": max(datum, start_date),
+            "Vart": text_clean,
+            "Summa": summa
+        })
+
+    parsed = [tx for tx in parsed if tx["Datum"] <= end_date]
+    return sorted(parsed, key=lambda x: x["Datum"])
+
+# Streamlit UI
 st.set_page_config(page_title="Kategorisera Utgifter", layout="centered")
 st.title("📄 Kategorisera Utgifter")
 
-# Initiera state
+# Initiera session state
 for key in ['index', 'resultat', 'transactions', 'started', 'start_date', 'end_date']:
     if key not in st.session_state:
         st.session_state[key] = None if key in ['start_date', 'end_date'] else []
@@ -71,13 +77,13 @@ if not st.session_state.started:
     if uploaded_file and st.button("🚀 Starta"):
         st.session_state.start_date = start_date
         st.session_state.end_date = end_date
-        st.session_state.transactions = robust_extract_transactions(uploaded_file, start_date, end_date)
+        st.session_state.transactions = extract_transactions(uploaded_file, start_date, end_date)
         st.session_state.resultat = []
         st.session_state.index = 0
         st.session_state.started = True
         st.rerun()
 
-# Visa transaktioner en i taget
+# Visar en transaktion i taget
 elif st.session_state.started:
     index = st.session_state.index
     transactions = st.session_state.transactions
