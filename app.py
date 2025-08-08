@@ -5,61 +5,63 @@ from datetime import datetime
 import pdfplumber
 import re
 
-# Alternativ för flervalsval
+# Alternativ för val
 PERSONER = ['Albin', 'Nathalie', 'Gemensamt']
 KATEGORIER = ['Mat', 'Hushåll', 'Nöje', 'Resa', 'Restaurang', 'Kläder', 'Hälsa', 'Annat']
 
-# Bättre parser som tolkar hela transaktionsblock
-def extract_transactions(pdf_file, start_date, end_date):
+# Parser som identifierar transaktioner och ignorerar "betalning mottagen"
+def parse_transactions(pdf_file, start_date, end_date):
     transactions = []
-    current_lines = []
-    pattern_datum = re.compile(r"(\d{2}\.\d{2}\.\d{2})\s+\d{2}\.\d{2}\.\d{2}")
+    pattern = re.compile(r"^(\d{2}\.\d{2}\.\d{2})\s+(\d{2}\.\d{2}\.\d{2})\s+(.*?)(-?\d{1,3}(?:[ \.]\d{3})*,\d{2})?$")
+    current = None
 
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             lines = page.extract_text().split('\n')
             for line in lines:
-                if pattern_datum.match(line.strip()):
-                    if current_lines:
-                        transactions.append(current_lines)
-                    current_lines = [line.strip()]
-                else:
-                    if current_lines is not None:
-                        current_lines.append(line.strip())
-        if current_lines:
-            transactions.append(current_lines)
+                line = line.strip()
+                match = pattern.match(line)
 
-    parsed = []
-    for group in transactions:
-        datum_match = re.match(r"(\d{2}\.\d{2}\.\d{2})", group[0])
-        if not datum_match:
+                if match:
+                    if current:
+                        transactions.append(current)
+
+                    datum = datetime.strptime(match.group(1), "%d.%m.%y").date()
+                    vart = match.group(3).strip()
+                    summa_str = match.group(4)
+                    summa = None
+                    if summa_str:
+                        try:
+                            summa = float(summa_str.replace(" ", "").replace(".", "").replace(",", "."))
+                        except:
+                            pass
+                    current = {"Datum": datum, "Vart": vart, "Summa": summa}
+                elif current:
+                    if re.match(r"^\d{2}\.\d{2}\.\d{2}", line):
+                        if current:
+                            transactions.append(current)
+                        current = None
+                    else:
+                        current["Vart"] += " " + line.strip()
+
+        if current:
+            transactions.append(current)
+
+    # Filtrera bort ogiltiga och irrelevanta transaktioner
+    filtered = []
+    for t in transactions:
+        if t["Summa"] is None:
             continue
-        datum = datetime.strptime(datum_match.group(1), "%d.%m.%y").date()
-
-        text_block = " ".join(group)
-        amount_match = re.findall(r"(\d{1,3}(?:[ \.]\d{3})*(?:,\d{2}))", text_block)
-        if not amount_match:
+        if "betalning mottagen" in t["Vart"].lower():
             continue
-
-        try:
-            amount_str = amount_match[-1].replace(".", "").replace(" ", "").replace(",", ".")
-            summa = float(amount_str)
-        except:
+        t["Datum"] = max(t["Datum"], start_date)
+        if t["Datum"] > end_date:
             continue
+        filtered.append(t)
 
-        text_clean = re.sub(r"(\d{1,3}(?:[ \.]\d{3})*(?:,\d{2}))", "", text_block)
-        text_clean = re.sub(r"\s{2,}", " ", text_clean).strip()
+    return sorted(filtered, key=lambda x: x["Datum"])
 
-        parsed.append({
-            "Datum": max(datum, start_date),
-            "Vart": text_clean,
-            "Summa": summa
-        })
-
-    parsed = [tx for tx in parsed if tx["Datum"] <= end_date]
-    return sorted(parsed, key=lambda x: x["Datum"])
-
-# Streamlit UI
+# UI start
 st.set_page_config(page_title="Kategorisera Utgifter", layout="centered")
 st.title("📄 Kategorisera Utgifter")
 
@@ -68,7 +70,7 @@ for key in ['index', 'resultat', 'transactions', 'started', 'start_date', 'end_d
     if key not in st.session_state:
         st.session_state[key] = None if key in ['start_date', 'end_date'] else []
 
-# Startformulär
+# Laddningsvy
 if not st.session_state.started:
     uploaded_file = st.file_uploader("Ladda upp PDF-kontoutdrag", type=["pdf"])
     start_date = st.date_input("Från datum", value=datetime.today(), key="start_date_input")
@@ -77,7 +79,7 @@ if not st.session_state.started:
     if uploaded_file and st.button("🚀 Starta"):
         st.session_state.start_date = start_date
         st.session_state.end_date = end_date
-        st.session_state.transactions = extract_transactions(uploaded_file, start_date, end_date)
+        st.session_state.transactions = parse_transactions(uploaded_file, start_date, end_date)
         st.session_state.resultat = []
         st.session_state.index = 0
         st.session_state.started = True
