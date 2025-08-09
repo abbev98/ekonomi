@@ -4,7 +4,7 @@ import io
 from datetime import datetime, date
 
 # App options
-PERSONER = ['Albin', 'Nathalie', 'Gemensamt']
+PERSONER = ['Gemensamt', 'Albin', 'Nathalie']
 KATEGORIER = ['Mat', 'Hushåll', 'Nöje', 'Resa', 'Restaurang', 'Kläder', 'Hälsa', 'Annat']
 
 st.set_page_config(page_title="Kategorisera Utgifter (Excel)", layout="centered")
