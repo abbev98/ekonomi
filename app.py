@@ -1,18 +1,39 @@
 import streamlit as st
 import pandas as pd
 import io
+import re
 from datetime import datetime, date
 
 # --- Konstanter ---
-PERSONER = ['Gemensamt', 'Albin', 'Nathalie']  # Gemensamt först/förvalt
+PERSONER = ['Gemensamt', 'Albin', 'Nathalie']
 KATEGORIER = ['Mat', 'Hushåll', 'Nöje', 'Resa', 'Restaurang', 'Kläder', 'Hälsa', 'Annat']
 
-# Fasta Amex-kolumner
-COL_DESC = "Transaktionsuppgifter"
-COL_DATE = "Transaktionsdatum"
-COL_AMOUNT = "Belopp i SEK"
+# Kandidatnamn (lägg till fler om din export skiljer sig)
+CAND_DATE   = ["Transaktionsdatum", "Transaktions-datum", "Datum", "Transaction Date", "Date"]
+CAND_DESC   = ["Transaktionsuppgifter", "Uppgifter", "Butik", "Beskrivning", "Description", "Merchant"]
+CAND_AMOUNT = ["Belopp i SEK", "Belopp", "Amount", "SEK", "Belopp (SEK)"]
 
 # --- Hjälpare ---
+def norm_colname(s: str) -> str:
+    # normalisera kolumnnamn för matchning (små bokstäver, ta bort icke-bokstav/siffra)
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9åäö]+", "", s)
+    return s
+
+def find_col(df: pd.DataFrame, candidates):
+    norm_map = {norm_colname(c): c for c in df.columns}
+    for cand in candidates:
+        n = norm_colname(cand)
+        if n in norm_map:
+            return norm_map[n]
+    # Lite generös fuzzy: testa startswith/contains
+    for cand in candidates:
+        n = norm_colname(cand)
+        for col in df.columns:
+            if norm_colname(col).startswith(n) or n in norm_colname(col):
+                return col
+    return None
+
 def parse_date_any(x):
     if pd.isna(x):
         return None
@@ -36,30 +57,42 @@ def parse_amount(x):
     if pd.isna(x):
         return None
     s = str(x).strip().replace(" ", "")
-    negative = False
+    neg = False
     if s.startswith("(") and s.endswith(")"):
-        negative = True
+        neg = True
         s = s[1:-1]
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".")
     elif "," in s:
         s = s.replace(",", ".")
     try:
-        val = float(s)
-        return -val if negative else val
+        v = float(s)
+        return -v if neg else v
     except Exception:
         return None
 
-def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    # Säkerställ att kolumnerna finns
-    missing = [c for c in [COL_DESC, COL_DATE, COL_AMOUNT] if c not in df.columns]
+def normalize_df_autodetect(df: pd.DataFrame) -> pd.DataFrame:
+    col_date = find_col(df, CAND_DATE)
+    col_desc = find_col(df, CAND_DESC)
+    col_amt  = find_col(df, CAND_AMOUNT)
+
+    missing = []
+    if not col_desc: missing.append("Transaktionsuppgifter")
+    if not col_date: missing.append("Transaktionsdatum")
+    if not col_amt:  missing.append("Belopp i SEK")
     if missing:
-        raise ValueError(f"Saknar kolumner i filen: {', '.join(missing)}")
+        cols_list = ", ".join(map(str, df.columns))
+        raise ValueError(
+            "Hittade inte följande kolumner: "
+            + ", ".join(missing)
+            + f".\nRubriker i din fil: {cols_list}\n"
+            "Lägg till rätt rubriker i exporten eller be mig lägga till fler kandidater i appen."
+        )
 
     out = pd.DataFrame({
-        "Vart": df[COL_DESC].astype(str).str.strip(),
-        "Datum": df[COL_DATE].apply(parse_date_any),
-        "Summa": df[COL_AMOUNT].apply(parse_amount),
+        "Vart":  df[col_desc].astype(str).str.strip(),
+        "Datum": df[col_date].apply(parse_date_any),
+        "Summa": df[col_amt].apply(parse_amount),
     })
     out = out.dropna(subset=["Datum", "Summa"]).copy()
     out["Vart"] = out["Vart"].str.replace(r"\s+", " ", regex=True).str.strip()
@@ -67,7 +100,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="Kategorisera Utgifter – Amex Excel", layout="centered")
-st.title("📄 Kategorisera Utgifter – Amex Excel")
+st.title("📄 Kategorisera Utgifter – Amex Excel (autodetektion)")
 
 # State
 defaults = {'index': 0, 'resultat': [], 'transactions': [], 'started': False, 'start_date': None, 'end_date': None}
@@ -82,7 +115,7 @@ if not st.session_state.started:
     end_date   = st.date_input("Till datum", value=today, key="end_date_input")
 
     if uploaded is not None and st.button("🚀 Starta"):
-        # Läs fil (utan förhandsvisning eller mappning)
+        # Läs fil
         if uploaded.name.lower().endswith(".csv"):
             try:
                 df_raw = pd.read_csv(uploaded)
@@ -91,14 +124,18 @@ if not st.session_state.started:
         else:
             df_raw = pd.read_excel(uploaded)
 
-        # Normalisera
-        df = normalize_df(df_raw)
+        # Normalisera med autodetektion
+        try:
+            df = normalize_df_autodetect(df_raw)
+        except ValueError as e:
+            st.error(str(e))
+            st.stop()
 
         # Datumskift & filter
         df["Datum"] = df["Datum"].apply(lambda d: start_date if d < start_date else d)
         df = df[df["Datum"] <= end_date].copy()
 
-        # Sortera på datum (äldst först)
+        # Sortera på datum
         df = df.sort_values("Datum").reset_index(drop=True)
 
         # Spara i state
