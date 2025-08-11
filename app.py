@@ -4,35 +4,36 @@ import io
 import re
 from datetime import datetime, date
 
-# --- Konstanter ---
+# ---- Alternativ för val ----
 PERSONER = ['Gemensamt', 'Albin', 'Nathalie']
 KATEGORIER = ['Mat', 'Hushåll', 'Nöje', 'Resa', 'Restaurang', 'Kläder', 'Hälsa', 'Annat']
 
-# Kandidatnamn (lägg till fler om din export skiljer sig)
-CAND_DATE   = ["Transaktionsdatum", "Transaktions-datum", "Datum", "Transaction Date", "Date"]
-CAND_DESC   = ["Transaktionsuppgifter", "Uppgifter", "Butik", "Beskrivning", "Description", "Merchant"]
-CAND_AMOUNT = ["Belopp i SEK", "Belopp", "Amount", "SEK", "Belopp (SEK)"]
+# ---- Kandidater (sv/eng & varianter) ----
+CAND_DATE   = [
+    "Transaktionsdatum", "Transaktions-datum", "Datum", "Bokföringsdatum",
+    "Transaction Date", "Date", "Posted Date"
+]
+CAND_DESC   = [
+    "Transaktionsuppgifter", "Uppgifter", "Butik", "Beskrivning",
+    "Transaction Details", "Description", "Merchant", "Details"
+]
+CAND_AMOUNT = [
+    "Belopp i SEK", "Belopp", "SEK", "Amount", "Amount (SEK)", "Belopp (SEK)",
+    "Debet", "Kredit"
+]
 
-# --- Hjälpare ---
+# Fråserader/sektioner att ignorera
+NOISE_PHRASES = [
+    "betalning mottagen", "inbetalningar", "summa nya inbetalningar",
+    "summan av alla nya köp", "periodens del av årsavgift", "kategori saldo",
+    "gällande räntesatser", "sas amex premium", "transaktionsspecifikationer"
+]
+
+# ---- Normaliseringshjälpare ----
 def norm_colname(s: str) -> str:
-    # normalisera kolumnnamn för matchning (små bokstäver, ta bort icke-bokstav/siffra)
-    s = s.strip().lower()
+    s = (str(s) if s is not None else "").strip().lower()
     s = re.sub(r"[^a-z0-9åäö]+", "", s)
     return s
-
-def find_col(df: pd.DataFrame, candidates):
-    norm_map = {norm_colname(c): c for c in df.columns}
-    for cand in candidates:
-        n = norm_colname(cand)
-        if n in norm_map:
-            return norm_map[n]
-    # Lite generös fuzzy: testa startswith/contains
-    for cand in candidates:
-        n = norm_colname(cand)
-        for col in df.columns:
-            if norm_colname(col).startswith(n) or n in norm_colname(col):
-                return col
-    return None
 
 def parse_date_any(x):
     if pd.isna(x):
@@ -43,7 +44,7 @@ def parse_date_any(x):
         except Exception:
             return None
     s = str(x).strip()
-    for fmt in ("%Y-%m-%d", "%d.%m.%y", "%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y"):
+    for fmt in ("%Y-%m-%d", "%d.%m.%y", "%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y"):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:
@@ -65,42 +66,159 @@ def parse_amount(x):
         s = s.replace(".", "").replace(",", ".")
     elif "," in s:
         s = s.replace(",", ".")
+    # Hantera t.ex. "CR" och textrester
+    s = re.sub(r"[^0-9\.-]", "", s)
+    if s in ("", "-", ".", "-.", ".-"):
+        return None
     try:
         v = float(s)
         return -v if neg else v
     except Exception:
         return None
 
-def normalize_df_autodetect(df: pd.DataFrame) -> pd.DataFrame:
-    col_date = find_col(df, CAND_DATE)
-    col_desc = find_col(df, CAND_DESC)
-    col_amt  = find_col(df, CAND_AMOUNT)
+def clean_noise(desc: str) -> bool:
+    d = (desc or "").strip().lower()
+    if not d:
+        return False
+    for phrase in NOISE_PHRASES:
+        if phrase in d:
+            return False
+    # Enstaka "CR" som rad = brus
+    if d == "cr":
+        return False
+    return True
 
-    missing = []
-    if not col_desc: missing.append("Transaktionsuppgifter")
-    if not col_date: missing.append("Transaktionsdatum")
-    if not col_amt:  missing.append("Belopp i SEK")
-    if missing:
-        cols_list = ", ".join(map(str, df.columns))
+# ---- Hitta tabell i "rapport-Excel" ----
+def find_header_row(df_no_header: pd.DataFrame, max_scan_rows: int = 50):
+    """
+    Returnerar (header_row_index) där rubrikerna sannolikt finns,
+    annars None om ingen bra match hittas.
+    """
+    def score_row(vals):
+        labels = [norm_colname(v) for v in vals]
+        hits = 0
+        # räkna träffar mot kandidater
+        def has_any(cands):
+            for c in cands:
+                n = norm_colname(c)
+                for lab in labels:
+                    if lab == n or lab.startswith(n) or n in lab:
+                        return True
+            return False
+        if has_any(CAND_DATE):   hits += 1
+        if has_any(CAND_DESC):   hits += 1
+        if has_any(CAND_AMOUNT): hits += 1
+        return hits
+
+    best_row, best_score = None, -1
+    n = min(len(df_no_header), max_scan_rows)
+    for i in range(n):
+        vals = list(df_no_header.iloc[i, :])
+        sc = score_row(vals)
+        if sc > best_score:
+            best_score = sc
+            best_row = i
+    return best_row if best_score >= 2 else None  # kräver minst 2 kategorier matchade
+
+def load_transactions_table(uploaded_file) -> pd.DataFrame:
+    # Läs utan header för att kunna hitta rubrikrad
+    if uploaded_file.name.lower().endswith(".csv"):
+        try:
+            df0 = pd.read_csv(uploaded_file, header=None)
+        except UnicodeDecodeError:
+            df0 = pd.read_csv(uploaded_file, header=None, encoding="latin-1", sep=";")
+    else:
+        df0 = pd.read_excel(uploaded_file, header=None)
+
+    header_row = find_header_row(df0)
+    if header_row is None:
         raise ValueError(
-            "Hittade inte följande kolumner: "
-            + ", ".join(missing)
-            + f".\nRubriker i din fil: {cols_list}\n"
-            "Lägg till rätt rubriker i exporten eller be mig lägga till fler kandidater i appen."
+            "Kunde inte lokalisera rubrikraden i Excel-arket. "
+            "Kontrollera att filen är Amex-exporten med kolumner som Transaktionsdatum / Transaktionsuppgifter / Belopp i SEK."
         )
 
+    headers = df0.iloc[header_row].tolist()
+    data = df0.iloc[header_row + 1:].copy()
+    data.columns = headers
+
+    # Ta bort helt tomma rader och tomma kolumner
+    data = data.dropna(how="all")
+    data = data.loc[:, data.columns.notna()]
+    # Rensa bort "Unnamed" och kolumner som nästan bara är NaN (rubrikskräp)
+    keep_cols = []
+    for c in data.columns:
+        cname = str(c)
+        if cname.lower().startswith("unnamed"):
+            # behåll bara om den faktiskt har mycket data
+            if data[c].notna().sum() > 5:
+                keep_cols.append(c)
+        else:
+            keep_cols.append(c)
+    data = data[keep_cols]
+
+    return data
+
+def find_col(df: pd.DataFrame, candidates):
+    norm_map = {norm_colname(c): c for c in df.columns if c is not None}
+    for cand in candidates:
+        n = norm_colname(cand)
+        if n in norm_map:
+            return norm_map[n]
+    # Fuzzy fallback
+    for cand in candidates:
+        n = norm_colname(cand)
+        for col in df.columns:
+            if col is None: 
+                continue
+            cn = norm_colname(col)
+            if cn.startswith(n) or n in cn:
+                return col
+    return None
+
+def normalize_df_autodetect(df_any: pd.DataFrame) -> pd.DataFrame:
+    # df_any är nu själva tabellen med "riktiga" headers
+    col_date = find_col(df_any, CAND_DATE)
+    col_desc = find_col(df_any, CAND_DESC)
+    col_amt  = find_col(df_any, CAND_AMOUNT)
+
+    missing = []
+    if not col_desc: missing.append("Transaktionsuppgifter/Description")
+    if not col_date: missing.append("Transaktionsdatum/Date")
+    if not col_amt:  missing.append("Belopp i SEK/Amount")
+    if missing:
+        raise ValueError(
+            "Hittade inte följande kolumner i tabellen: " + ", ".join(missing) +
+            f".\nUpptäckta rubriker: {', '.join(map(str, df_any.columns))}"
+        )
+
+    # Om både Debet och Kredit finns, slå ihop till en "Belopp" (Debet positivt, Kredit negativt)
+    if norm_colname(col_amt) in [norm_colname("Debet"), norm_colname("Kredit")]:
+        col_debet = find_col(df_any, ["Debet"])
+        col_kredit = find_col(df_any, ["Kredit"])
+        if col_debet and col_kredit:
+            amt_series = df_any[col_debet].apply(parse_amount).fillna(0) - df_any[col_kredit].apply(parse_amount).fillna(0)
+        elif col_debet:
+            amt_series = df_any[col_debet].apply(parse_amount)
+        else:
+            amt_series = -df_any[col_kredit].apply(parse_amount)
+    else:
+        amt_series = df_any[col_amt].apply(parse_amount)
+
     out = pd.DataFrame({
-        "Vart":  df[col_desc].astype(str).str.strip(),
-        "Datum": df[col_date].apply(parse_date_any),
-        "Summa": df[col_amt].apply(parse_amount),
+        "Vart":  df_any[col_desc].astype(str).str.strip(),
+        "Datum": df_any[col_date].apply(parse_date_any),
+        "Summa": amt_series,
     })
+
+    # Brusfilter
+    out = out[out["Vart"].apply(clean_noise)]
     out = out.dropna(subset=["Datum", "Summa"]).copy()
     out["Vart"] = out["Vart"].str.replace(r"\s+", " ", regex=True).str.strip()
     return out
 
-# --- Streamlit UI ---
+# ---- Streamlit UI ----
 st.set_page_config(page_title="Kategorisera Utgifter – Amex Excel", layout="centered")
-st.title("📄 Kategorisera Utgifter – Amex Excel (autodetektion)")
+st.title("📄 Kategorisera Utgifter – Amex Excel (robust rubrikdetektering)")
 
 # State
 defaults = {'index': 0, 'resultat': [], 'transactions': [], 'started': False, 'start_date': None, 'end_date': None}
@@ -115,30 +233,19 @@ if not st.session_state.started:
     end_date   = st.date_input("Till datum", value=today, key="end_date_input")
 
     if uploaded is not None and st.button("🚀 Starta"):
-        # Läs fil
-        if uploaded.name.lower().endswith(".csv"):
-            try:
-                df_raw = pd.read_csv(uploaded)
-            except UnicodeDecodeError:
-                df_raw = pd.read_csv(uploaded, encoding="latin-1", sep=";")
-        else:
-            df_raw = pd.read_excel(uploaded)
-
-        # Normalisera med autodetektion
+        # Läs rapportfil och hitta tabellen
         try:
-            df = normalize_df_autodetect(df_raw)
-        except ValueError as e:
+            df_table = load_transactions_table(uploaded)
+            df = normalize_df_autodetect(df_table)
+        except Exception as e:
             st.error(str(e))
             st.stop()
 
         # Datumskift & filter
         df["Datum"] = df["Datum"].apply(lambda d: start_date if d < start_date else d)
         df = df[df["Datum"] <= end_date].copy()
-
-        # Sortera på datum
         df = df.sort_values("Datum").reset_index(drop=True)
 
-        # Spara i state
         st.session_state.transactions = df.to_dict(orient="records")
         st.session_state.resultat = []
         st.session_state.index = 0
@@ -182,7 +289,6 @@ else:
         st.subheader("📊 Resultat (kopiera till Google Kalkylark):")
         st.dataframe(df_out, use_container_width=True)
 
-        # Excel-nedladdning
         excel_buffer = io.BytesIO()
         df_out.to_excel(excel_buffer, index=False)
         excel_buffer.seek(0)
